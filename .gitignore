@@ -22,6 +22,9 @@ frontend/dist/
 .npm
 .cache
 
+# 本地參考資料（不入版控）
+參考/
+
 # OS & editors
 .DS_Store
 Thumbs.db
