@@ -5,7 +5,7 @@ APP_USAGE_SOURCE = "碳盤查數據擷取 Demo 使用說明"
 KNOWLEDGE_BASE = [
     {
         "source": APP_USAGE_SOURCE,
-        "source_url": "https://localhost:5173",
+        "source_url": "https://github.com/rayfong61/carbon-demo#操作說明demo-動線",
         "content": (
             "本系統為碳盤查數據擷取 Demo，展示從電費單上傳到碳排數字入庫的端到端流程，"
             "並內建 AI 永續法規小助手，可查詢 GHG 盤查與法規相關問題。"
