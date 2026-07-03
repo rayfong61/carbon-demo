@@ -99,6 +99,8 @@ carbon-demo/
 │   ├── make_sample_bill.py  # 產生合成測試電費單（虛構資料）
 │   ├── sample_bill.png      # 執行上述腳本後產生，供 Demo 使用
 │   ├── requirements.txt
+│   ├── pytest.ini
+│   ├── tests/               # pytest 單元與 API 整合測試
 │   ├── .env.example         # ANTHROPIC_API_KEY 範本
 │   ├── carbon.db            # SQLite（執行後自動建立，已 gitignore）
 │   └── uploads/             # 上傳憑證儲存（已 gitignore）
@@ -253,6 +255,16 @@ curl http://localhost:8000/api/health
 ```
 
 `demo_mode: true` 表示未設定 API Key，抽取端點使用預錄結果。
+
+### 執行測試
+
+```bash
+cd backend
+pip install -r requirements.txt
+pytest
+```
+
+測試涵蓋：`validate()` / `pick_factor()` 單元測試，以及 API 端點整合測試（使用隔離的暫存 DB，不影響開發資料）。
 
 ---
 

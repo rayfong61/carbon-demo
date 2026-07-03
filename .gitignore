@@ -21,6 +21,7 @@ frontend/dist/
 *.log
 .npm
 .cache
+.pytest_cache/
 
 # 本地參考資料（不入版控）
 參考/

@@ -3,3 +3,7 @@ uvicorn[standard]==0.32.*
 anthropic>=0.40
 python-multipart
 python-dotenv
+
+# dev / test
+pytest>=8.0
+httpx>=0.27
