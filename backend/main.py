@@ -16,6 +16,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from knowledge_base import APP_USAGE_SOURCE, DEMO_RAG_ANSWERS, KNOWLEDGE_BASE, NO_MATCH_ANSWER
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------- 基礎設定
@@ -173,6 +175,16 @@ def validate(fields: dict) -> list[str]:
     return warnings
 
 
+def find_record_by_sha(file_sha256: str) -> dict | None:
+    """依憑證 SHA-256 查是否已入庫（同一檔案內容不重複盤查）。"""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id, created_at, file_name, kwh, emission_kgco2e FROM records WHERE file_sha256=?",
+            (file_sha256,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 @app.post("/api/extract")
 async def extract(file: UploadFile = File(...)):
     data = await file.read()
@@ -204,6 +216,7 @@ async def extract(file: UploadFile = File(...)):
         "extraction": extraction,
         "warnings": validate(extraction),
         "mode": mode,
+        "duplicate_of": find_record_by_sha(sha),
     }
 
 
@@ -224,6 +237,13 @@ def create_record(p: ConfirmPayload):
     kwh = float(p.confirmed.get("kwh") or 0)
     if kwh <= 0:
         raise HTTPException(422, "用電度數必須大於 0")
+
+    existing = find_record_by_sha(p.file_sha256)
+    if existing:
+        raise HTTPException(
+            409,
+            f"此憑證已入庫（紀錄 #{existing['id']}，{existing['created_at']}），請勿重複盤查同一張單據",
+        )
 
     factor = pick_factor(p.confirmed.get("billing_end", ""))
     emission = round(kwh * factor["value"], 2)
@@ -291,6 +311,224 @@ def factors():
     return EMISSION_FACTORS
 
 
+# ---------------------------------------------------------------- RAG 法規問答
+RAG_SCORE_THRESHOLD = 0.12
+RAG_LOW_CONFIDENCE_THRESHOLD = 0.18
+RAG_MAX_QUERY_LEN = 500
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+_rag_vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(1, 3))
+_rag_matrix = _rag_vectorizer.fit_transform(
+    [d["source"] + " " + d["content"] for d in KNOWLEDGE_BASE]
+)
+
+_APP_USAGE_INDEX = next(
+    i for i, d in enumerate(KNOWLEDGE_BASE) if d["source"] == APP_USAGE_SOURCE
+)
+
+RAG_PROMPT = """你是企業永續法規顧問。請僅根據以下參考資料回答問題。
+若資料不足以回答，請明確說明，不要捏造法條或數字。
+
+【參考資料】
+來源：{source}
+{content}
+
+【使用者問題】
+{query}
+
+請用繁體中文、簡潔專業地作答。"""
+
+
+def is_app_usage_query(query: str) -> bool:
+    q = query.strip().replace(" ", "").lower()
+    if not q:
+        return False
+    if "怎麼算" in q or "如何計算" in q:
+        return False
+    direct = (
+        "app用法",
+        "系統用法",
+        "系統怎麼用",
+        "系統如何用",
+        "使用教學",
+        "操作說明",
+        "使用說明",
+    )
+    if any(p in q for p in direct):
+        return True
+    app_markers = ("這個系統", "本系統", "這個app", "本app", "這個平台", "碳盤查demo")
+    usage_markers = ("怎麼用", "如何用", "用法", "怎麼使用", "如何使用", "怎麼操作")
+    return any(m in q for m in app_markers) and any(m in q for m in usage_markers)
+
+
+def app_usage_context() -> dict:
+    doc = KNOWLEDGE_BASE[_APP_USAGE_INDEX]
+    return {
+        "source": doc["source"],
+        "source_url": doc["source_url"],
+        "content": doc["content"],
+        "score": 1.0,
+        "index": _APP_USAGE_INDEX,
+        "matched": True,
+    }
+
+
+def retrieve_context(query: str) -> dict:
+    if is_app_usage_query(query):
+        return app_usage_context()
+    q_vec = _rag_vectorizer.transform([query])
+    scores = cosine_similarity(q_vec, _rag_matrix)[0]
+    idx = int(scores.argmax())
+    doc = KNOWLEDGE_BASE[idx]
+    return {
+        "source": doc["source"],
+        "source_url": doc["source_url"],
+        "content": doc["content"],
+        "score": float(scores[idx]),
+        "index": idx,
+        "matched": float(scores[idx]) >= RAG_SCORE_THRESHOLD,
+    }
+
+
+def call_claude_text(prompt: str) -> str:
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=API_KEY)
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return "".join(b.text for b in msg.content if b.type == "text")
+
+
+def stream_claude_text(prompt: str):
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=API_KEY)
+    with client.messages.stream(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        yield from stream.text_stream
+
+
+def demo_rag_answer(source: str) -> str:
+    return DEMO_RAG_ANSWERS.get(source, DEMO_RAG_ANSWERS["GHG Protocol Scope 2 指引"])
+
+
+def validate_rag_query(query: str) -> str:
+    q = query.strip()
+    if not q:
+        raise HTTPException(422, "問題不可為空")
+    if len(q) > RAG_MAX_QUERY_LEN:
+        raise HTTPException(422, f"問題不可超過 {RAG_MAX_QUERY_LEN} 字")
+    return q
+
+
+def rag_meta_payload(ctx: dict) -> dict:
+    if not ctx["matched"]:
+        return {
+            "source": None,
+            "source_url": None,
+            "score": ctx["score"],
+            "low_confidence": False,
+            "mode": "no_match",
+        }
+    return {
+        "source": ctx["source"],
+        "source_url": ctx["source_url"],
+        "score": ctx["score"],
+        "low_confidence": ctx["score"] < RAG_LOW_CONFIDENCE_THRESHOLD,
+    }
+
+
+def iter_answer_chunks(answer: str, chunk_size: int = 6):
+    for i in range(0, len(answer), chunk_size):
+        yield answer[i : i + chunk_size]
+
+
+def sse_event(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def rag_stream_events(query: str):
+    q = validate_rag_query(query)
+    ctx = retrieve_context(q)
+    meta = rag_meta_payload(ctx)
+    yield sse_event({"type": "meta", **meta})
+
+    if not ctx["matched"]:
+        for piece in iter_answer_chunks(NO_MATCH_ANSWER):
+            time.sleep(0.02)
+            yield sse_event({"type": "chunk", "text": piece})
+        yield sse_event({"type": "done"})
+        return
+
+    prompt = RAG_PROMPT.format(
+        source=ctx["source"], content=ctx["content"], query=q
+    )
+
+    if DEMO_MODE:
+        answer = demo_rag_answer(ctx["source"])
+        for piece in iter_answer_chunks(answer):
+            time.sleep(0.02)
+            yield sse_event({"type": "chunk", "text": piece})
+        yield sse_event({"type": "done", "mode": "demo"})
+        return
+
+    try:
+        for piece in stream_claude_text(prompt):
+            if piece:
+                yield sse_event({"type": "chunk", "text": piece})
+        yield sse_event({"type": "done", "mode": "live"})
+    except Exception:
+        answer = demo_rag_answer(ctx["source"])
+        for piece in iter_answer_chunks(answer):
+            time.sleep(0.02)
+            yield sse_event({"type": "chunk", "text": piece})
+        yield sse_event({"type": "done", "mode": "fallback"})
+
+
+class RagQuery(BaseModel):
+    query: str
+
+
+def build_rag_answer(query: str) -> dict:
+    q = validate_rag_query(query)
+    ctx = retrieve_context(q)
+    meta = rag_meta_payload(ctx)
+    if not ctx["matched"]:
+        return {**meta, "answer": NO_MATCH_ANSWER}
+
+    prompt = RAG_PROMPT.format(
+        source=ctx["source"], content=ctx["content"], query=q
+    )
+    if DEMO_MODE:
+        return {**meta, "answer": demo_rag_answer(ctx["source"]), "mode": "demo"}
+    try:
+        return {**meta, "answer": call_claude_text(prompt), "mode": "live"}
+    except Exception:
+        return {**meta, "answer": demo_rag_answer(ctx["source"]), "mode": "fallback"}
+
+
+@app.post("/api/chat/rag")
+def chat_rag(p: RagQuery):
+    return build_rag_answer(p.query)
+
+
+@app.post("/api/chat/rag/stream")
+def chat_rag_stream(p: RagQuery):
+    return StreamingResponse(
+        rag_stream_events(p.query),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "demo_mode": DEMO_MODE}
+    return {"status": "ok", "demo_mode": DEMO_MODE, "rag_kb_count": len(KNOWLEDGE_BASE)}
